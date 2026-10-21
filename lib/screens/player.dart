@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:chewie/chewie.dart';
 import 'package:video_player/video_player.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
@@ -18,10 +17,10 @@ class Player extends StatefulWidget {
 
 class _PlayerState extends State<Player> {
   VideoPlayerController? _videoPlayerController;
-  ChewieController? _chewieController;
   bool _isLoading = true;
   bool _channelNotFound = false;
   bool _showOverlay = false;
+  BoxFit _boxFit = BoxFit.contain;
   Timer? _hideOverlayTimer;
   Timer? _stallRecoveryTimer;
   Duration _lastPosition = Duration.zero;
@@ -32,7 +31,19 @@ class _PlayerState extends State<Player> {
     super.initState();
     HardwareKeyboard.instance.addHandler(_handleRemoteKey);
     WakelockPlus.enable();
+    _setImmersiveMode();
     _initializePlayer();
+  }
+
+  void _setImmersiveMode() {
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+  }
+
+  void _restoreUIMode() {
+    SystemChrome.setEnabledSystemUIMode(
+      SystemUiMode.manual,
+      overlays: SystemUiOverlay.values,
+    );
   }
 
   Future<void> _initializePlayer() async {
@@ -49,27 +60,7 @@ class _PlayerState extends State<Player> {
       await controller.initialize().timeout(const Duration(seconds: 15));
       if (!mounted) return;
 
-      final chewie = ChewieController(
-        videoPlayerController: controller,
-        autoPlay: true,
-        isLive: true,
-        showOptions: false,
-        showControlsOnInitialize: false,
-        allowFullScreen: true,
-        allowMuting: false,
-        zoomAndPan: false,
-        materialProgressColors: ChewieProgressColors(
-          playedColor: const Color(0xFFFF2E56),
-          handleColor: const Color(0xFFFF2E56),
-          bufferedColor: Colors.white24,
-          backgroundColor: Colors.white10,
-        ),
-        errorBuilder: (context, errorMessage) {
-          return _UnavailablePlayer(onRetry: _retryChannel);
-        },
-      );
-
-      _chewieController = chewie;
+      await controller.play();
 
       controller.addListener(_onPlayerStateChanged);
 
@@ -78,6 +69,8 @@ class _PlayerState extends State<Player> {
           _isLoading = false;
           _channelNotFound = false;
         });
+        // Reveal controls briefly on start, then auto-fade
+        _revealOverlay();
       }
     } catch (_) {
       if (mounted) {
@@ -113,6 +106,7 @@ class _PlayerState extends State<Player> {
         _lastPosition = controller.value.position;
         _stallCount = 0;
         _stallRecoveryTimer?.cancel();
+        _stallRecoveryTimer = null;
       }
     } else if (controller.value.isPlaying && controller.value.isBuffering) {
       _stallRecoveryTimer ??= Timer(const Duration(seconds: 8), () {
@@ -148,16 +142,14 @@ class _PlayerState extends State<Player> {
     _hideOverlayTimer?.cancel();
     _stallRecoveryTimer?.cancel();
 
-    final chewie = _chewieController;
     final video = _videoPlayerController;
-
     if (video != null) {
       video.removeListener(_onPlayerStateChanged);
+      video.dispose();
     }
-    chewie?.dispose();
-    video?.dispose();
 
     WakelockPlus.disable();
+    _restoreUIMode();
     super.dispose();
   }
 
@@ -168,18 +160,13 @@ class _PlayerState extends State<Player> {
       _showOverlay = false;
     });
 
-    final chewie = _chewieController;
     final video = _videoPlayerController;
-
     if (video != null) {
       video.removeListener(_onPlayerStateChanged);
+      video.dispose();
     }
-    chewie?.dispose();
-    video?.dispose();
 
-    _chewieController = null;
     _videoPlayerController = null;
-
     _initializePlayer();
   }
 
@@ -195,7 +182,7 @@ class _PlayerState extends State<Player> {
   void _revealOverlay() {
     _hideOverlayTimer?.cancel();
     setState(() => _showOverlay = true);
-    _hideOverlayTimer = Timer(const Duration(milliseconds: 5000), () {
+    _hideOverlayTimer = Timer(const Duration(milliseconds: 3500), () {
       if (mounted) setState(() => _showOverlay = false);
     });
   }
@@ -242,16 +229,12 @@ class _PlayerState extends State<Player> {
       return true;
     }
 
-    // Arrow keys reveal overlay
+    // Arrow keys reveal overlay and reset timer
     if (key == LogicalKeyboardKey.arrowLeft ||
         key == LogicalKeyboardKey.arrowRight ||
         key == LogicalKeyboardKey.arrowUp ||
         key == LogicalKeyboardKey.arrowDown) {
-      if (!_showOverlay) {
-        _revealOverlay();
-      } else {
-        _revealOverlay(); // Reset timer
-      }
+      _revealOverlay();
       return true;
     }
 
@@ -284,8 +267,18 @@ class _PlayerState extends State<Player> {
     _revealOverlay();
   }
 
+  void _toggleFit() {
+    setState(() {
+      _boxFit = _boxFit == BoxFit.contain ? BoxFit.cover : BoxFit.contain;
+    });
+    _revealOverlay();
+  }
+
   @override
   Widget build(BuildContext context) {
+    final controller = _videoPlayerController;
+    final isInitialized = controller?.value.isInitialized ?? false;
+
     return Scaffold(
       backgroundColor: Colors.black,
       body: _isLoading
@@ -302,15 +295,51 @@ class _PlayerState extends State<Player> {
                     child: Stack(
                       fit: StackFit.expand,
                       children: [
-                        // Chewie player (handles surface lifecycle properly)
-                        if (_chewieController != null)
+                        // Direct VideoPlayer with BoxFit scaling
+                        if (controller != null && isInitialized)
                           Center(
-                            child: Chewie(
-                              controller: _chewieController!,
+                            child: FittedBox(
+                              fit: _boxFit,
+                              child: SizedBox(
+                                width: controller.value.size.width > 0
+                                    ? controller.value.size.width
+                                    : 16,
+                                height: controller.value.size.height > 0
+                                    ? controller.value.size.height
+                                    : 9,
+                                child: VideoPlayer(controller),
+                              ),
                             ),
                           ),
 
-                        // Custom top overlay – channel info + back
+                        // Buffering indicator
+                        if (controller != null && controller.value.isBuffering)
+                          const Center(
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                SizedBox(
+                                  width: 44,
+                                  height: 44,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 3.5,
+                                    color: Color(0xFF5B8CFF),
+                                  ),
+                                ),
+                                SizedBox(height: 12),
+                                Text(
+                                  'Buffering…',
+                                  style: TextStyle(
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.w600,
+                                    color: Colors.white70,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+
+                        // Custom top overlay – channel info + back + zoom
                         AnimatedOpacity(
                           opacity: _showOverlay ? 1.0 : 0.0,
                           duration: const Duration(milliseconds: 250),
@@ -426,6 +455,13 @@ class _PlayerState extends State<Player> {
                     ),
                   ],
                 ),
+              ),
+              _OverlayIconButton(
+                icon: _boxFit == BoxFit.contain
+                    ? Icons.fullscreen_rounded
+                    : Icons.fit_screen_rounded,
+                onTap: _toggleFit,
+                tooltip: _boxFit == BoxFit.contain ? 'Fill Screen' : 'Fit Screen',
               ),
             ],
           ),
