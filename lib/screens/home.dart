@@ -2,7 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import '/screens/player.dart';
+import 'player.dart';
 import '../model/channel.dart';
 import '../model/stream_source.dart';
 import '../provider/channels_provider.dart';

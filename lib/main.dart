@@ -6,6 +6,25 @@ import 'screens/home.dart';
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   MediaKit.ensureInitialized();
+
+  FlutterError.onError = (details) {
+    FlutterError.presentError(details);
+  };
+  ErrorWidget.builder = (details) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Text(
+            'Error: ${details.exceptionAsString()}',
+            style: const TextStyle(color: Colors.redAccent, fontSize: 16),
+          ),
+        ),
+      ),
+    );
+  };
+
   // Immersive: edge-to-edge dark status bar
   SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
     statusBarColor: Colors.transparent,
