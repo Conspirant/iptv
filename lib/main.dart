@@ -1,19 +1,27 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'screens/home.dart';
 
-void main() => runApp(M3UPlayer());
-
-class M3UPlayer extends StatefulWidget {
-  @override
-  _M3UPlayerState createState() => _M3UPlayerState();
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  // Immersive: edge-to-edge dark status bar
+  SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
+    statusBarColor: Colors.transparent,
+    statusBarIconBrightness: Brightness.light,
+    systemNavigationBarColor: Color(0xFF0B0F17),
+    systemNavigationBarIconBrightness: Brightness.light,
+  ));
+  runApp(const LiveTVApp());
 }
 
-class _M3UPlayerState extends State<M3UPlayer> {
+class LiveTVApp extends StatelessWidget {
+  const LiveTVApp({super.key});
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: 'Live Tv',
+      title: 'Live TV',
       theme: ThemeData(
         useMaterial3: true,
         brightness: Brightness.dark,
@@ -33,30 +41,17 @@ class _M3UPlayerState extends State<M3UPlayer> {
         cardTheme: CardThemeData(
           color: const Color(0xFF151A24),
           elevation: 0,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        ),
+        // Smooth page transitions
+        pageTransitionsTheme: const PageTransitionsTheme(
+          builders: {
+            TargetPlatform.android: FadeUpwardsPageTransitionsBuilder(),
+          },
         ),
       ),
-      home: const _AppShell(),
-    );
-  }
-}
-
-class _AppShell extends StatelessWidget {
-  const _AppShell();
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Row(
-          children: [
-            Icon(Icons.live_tv_rounded, color: Color(0xFF8EAEFF)),
-            SizedBox(width: 12),
-            Text('Live TV'),
-          ],
-        ),
-      ),
-      body: const Home(),
+      home: const Home(),
     );
   }
 }

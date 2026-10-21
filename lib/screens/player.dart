@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:chewie/chewie.dart';
 import 'package:video_player/video_player.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
@@ -16,16 +17,12 @@ class Player extends StatefulWidget {
 }
 
 class _PlayerState extends State<Player> {
-  static Future<void> _previousPlayerRelease = Future.value();
-
   VideoPlayerController? _videoPlayerController;
+  ChewieController? _chewieController;
   bool _isLoading = true;
   bool _channelNotFound = false;
-  bool _showControls = false;
-  bool _showPlaybackStatus = false;
-  int _selectedControl = 0; // 0: Play/Pause, 1: Go Live
-  Timer? _hideControlsTimer;
-  Timer? _feedbackTimer;
+  bool _showOverlay = false;
+  Timer? _hideOverlayTimer;
   Timer? _stallRecoveryTimer;
   Duration _lastPosition = Duration.zero;
   int _stallCount = 0;
@@ -35,17 +32,11 @@ class _PlayerState extends State<Player> {
     super.initState();
     HardwareKeyboard.instance.addHandler(_handleRemoteKey);
     WakelockPlus.enable();
-
     _initializePlayer();
   }
 
   Future<void> _initializePlayer() async {
     try {
-      // Android TV devices often have a single hardware decoder.
-      // Wait until any previous player releases decoder resources.
-      await _previousPlayerRelease;
-      if (!mounted) return;
-
       final controller = VideoPlayerController.networkUrl(
         Uri.parse(widget.channel.streamUrl),
         videoPlayerOptions: VideoPlayerOptions(
@@ -58,8 +49,29 @@ class _PlayerState extends State<Player> {
       await controller.initialize().timeout(const Duration(seconds: 15));
       if (!mounted) return;
 
+      final chewie = ChewieController(
+        videoPlayerController: controller,
+        autoPlay: true,
+        isLive: true,
+        showOptions: false,
+        showControlsOnInitialize: false,
+        allowFullScreen: true,
+        allowMuting: false,
+        zoomAndPan: false,
+        materialProgressColors: ChewieProgressColors(
+          playedColor: const Color(0xFFFF2E56),
+          handleColor: const Color(0xFFFF2E56),
+          bufferedColor: Colors.white24,
+          backgroundColor: Colors.white10,
+        ),
+        errorBuilder: (context, errorMessage) {
+          return _UnavailablePlayer(onRetry: _retryChannel);
+        },
+      );
+
+      _chewieController = chewie;
+
       controller.addListener(_onPlayerStateChanged);
-      await controller.play();
 
       if (mounted) {
         setState(() {
@@ -133,15 +145,17 @@ class _PlayerState extends State<Player> {
   @override
   void dispose() {
     HardwareKeyboard.instance.removeHandler(_handleRemoteKey);
-    _hideControlsTimer?.cancel();
-    _feedbackTimer?.cancel();
+    _hideOverlayTimer?.cancel();
     _stallRecoveryTimer?.cancel();
 
-    final controller = _videoPlayerController;
-    if (controller != null) {
-      controller.removeListener(_onPlayerStateChanged);
-      _previousPlayerRelease = controller.dispose().catchError((_) {});
+    final chewie = _chewieController;
+    final video = _videoPlayerController;
+
+    if (video != null) {
+      video.removeListener(_onPlayerStateChanged);
     }
+    chewie?.dispose();
+    video?.dispose();
 
     WakelockPlus.disable();
     super.dispose();
@@ -151,42 +165,38 @@ class _PlayerState extends State<Player> {
     setState(() {
       _isLoading = true;
       _channelNotFound = false;
-      _showControls = false;
+      _showOverlay = false;
     });
 
-    final controller = _videoPlayerController;
-    if (controller != null) {
-      controller.removeListener(_onPlayerStateChanged);
-      _previousPlayerRelease = controller.dispose().catchError((_) {});
-      _videoPlayerController = null;
+    final chewie = _chewieController;
+    final video = _videoPlayerController;
+
+    if (video != null) {
+      video.removeListener(_onPlayerStateChanged);
     }
+    chewie?.dispose();
+    video?.dispose();
+
+    _chewieController = null;
+    _videoPlayerController = null;
 
     _initializePlayer();
   }
 
-  void _toggleControls() {
-    if (_showControls) {
-      _hideControlsTimer?.cancel();
-      setState(() => _showControls = false);
+  void _toggleOverlay() {
+    if (_showOverlay) {
+      _hideOverlayTimer?.cancel();
+      setState(() => _showOverlay = false);
     } else {
-      _revealControls();
+      _revealOverlay();
     }
   }
 
-  void _revealControls() {
-    _hideControlsTimer?.cancel();
-    setState(() => _showControls = true);
-    // Auto-hide controls after 4.5 seconds like Hotstar/JioCinema
-    _hideControlsTimer = Timer(const Duration(milliseconds: 4500), () {
-      if (mounted) setState(() => _showControls = false);
-    });
-  }
-
-  void _showFeedbackIndicator() {
-    _feedbackTimer?.cancel();
-    setState(() => _showPlaybackStatus = true);
-    _feedbackTimer = Timer(const Duration(milliseconds: 900), () {
-      if (mounted) setState(() => _showPlaybackStatus = false);
+  void _revealOverlay() {
+    _hideOverlayTimer?.cancel();
+    setState(() => _showOverlay = true);
+    _hideOverlayTimer = Timer(const Duration(milliseconds: 5000), () {
+      if (mounted) setState(() => _showOverlay = false);
     });
   }
 
@@ -196,20 +206,35 @@ class _PlayerState extends State<Player> {
     }
 
     final key = event.logicalKey;
+
+    // Back button handling
+    if (key == LogicalKeyboardKey.goBack ||
+        key == LogicalKeyboardKey.escape ||
+        key == LogicalKeyboardKey.backspace) {
+      if (_showOverlay) {
+        _hideOverlayTimer?.cancel();
+        setState(() => _showOverlay = false);
+        return true;
+      }
+      Navigator.of(context).maybePop();
+      return true;
+    }
+
+    // Select/Enter shows overlay or toggles play
     final isSelect = key == LogicalKeyboardKey.select ||
         key == LogicalKeyboardKey.enter ||
         key == LogicalKeyboardKey.numpadEnter;
 
     if (isSelect) {
-      if (_showControls) {
-        _activateSelectedControl();
+      if (!_showOverlay) {
+        _revealOverlay();
       } else {
-        _selectedControl = 0;
-        _revealControls();
+        _togglePlayback();
       }
       return true;
     }
 
+    // Play/Pause media keys
     if (key == LogicalKeyboardKey.mediaPlayPause ||
         key == LogicalKeyboardKey.mediaPlay ||
         key == LogicalKeyboardKey.mediaPause) {
@@ -217,50 +242,20 @@ class _PlayerState extends State<Player> {
       return true;
     }
 
+    // Arrow keys reveal overlay
     if (key == LogicalKeyboardKey.arrowLeft ||
         key == LogicalKeyboardKey.arrowRight ||
         key == LogicalKeyboardKey.arrowUp ||
         key == LogicalKeyboardKey.arrowDown) {
-      if (!_showControls) {
-        _selectedControl = 0;
-        _revealControls();
-        return true;
+      if (!_showOverlay) {
+        _revealOverlay();
+      } else {
+        _revealOverlay(); // Reset timer
       }
-
-      _revealControls();
-
-      if (key == LogicalKeyboardKey.arrowLeft) {
-        setState(() => _selectedControl = (_selectedControl + 1) % 2);
-      } else if (key == LogicalKeyboardKey.arrowRight) {
-        setState(() => _selectedControl = (_selectedControl + 1) % 2);
-      }
-      return true;
-    }
-
-    if (key == LogicalKeyboardKey.goBack ||
-        key == LogicalKeyboardKey.escape ||
-        key == LogicalKeyboardKey.backspace) {
-      if (_showControls) {
-        _hideControlsTimer?.cancel();
-        setState(() => _showControls = false);
-        return true;
-      }
-      Navigator.of(context).maybePop();
       return true;
     }
 
     return false;
-  }
-
-  void _activateSelectedControl() {
-    switch (_selectedControl) {
-      case 0:
-        _togglePlayback();
-        break;
-      case 1:
-        _goLive();
-        break;
-    }
   }
 
   void _togglePlayback() {
@@ -272,8 +267,7 @@ class _PlayerState extends State<Player> {
     } else {
       controller.play();
     }
-    _showFeedbackIndicator();
-    _revealControls();
+    _revealOverlay();
   }
 
   Future<void> _goLive() async {
@@ -287,14 +281,11 @@ class _PlayerState extends State<Player> {
       }
     } catch (_) {}
     await controller.play();
-    _showFeedbackIndicator();
-    _revealControls();
+    _revealOverlay();
   }
 
   @override
   Widget build(BuildContext context) {
-    final controller = _videoPlayerController;
-
     return Scaffold(
       backgroundColor: Colors.black,
       body: _isLoading
@@ -303,7 +294,7 @@ class _PlayerState extends State<Player> {
               ? _UnavailablePlayer(onRetry: _retryChannel)
               : GestureDetector(
                   behavior: HitTestBehavior.opaque,
-                  onTap: _toggleControls,
+                  onTap: _toggleOverlay,
                   child: Container(
                     color: Colors.black,
                     width: double.infinity,
@@ -311,57 +302,31 @@ class _PlayerState extends State<Player> {
                     child: Stack(
                       fit: StackFit.expand,
                       children: [
-                        // Direct VideoPlayer widget with aspect ratio preservation
-                        if (controller != null && controller.value.isInitialized)
+                        // Chewie player (handles surface lifecycle properly)
+                        if (_chewieController != null)
                           Center(
-                            child: AspectRatio(
-                              aspectRatio: controller.value.aspectRatio > 0
-                                  ? controller.value.aspectRatio
-                                  : 16 / 9,
-                              child: VideoPlayer(controller),
+                            child: Chewie(
+                              controller: _chewieController!,
                             ),
                           ),
 
-                        // Top Bar (Channel title, red LIVE pill, back & refresh)
+                        // Custom top overlay – channel info + back
                         AnimatedOpacity(
-                          opacity: _showControls ? 1.0 : 0.0,
+                          opacity: _showOverlay ? 1.0 : 0.0,
                           duration: const Duration(milliseconds: 250),
                           child: IgnorePointer(
-                            ignoring: !_showControls,
-                            child: _buildTopBar(),
+                            ignoring: !_showOverlay,
+                            child: _buildTopOverlay(),
                           ),
                         ),
 
-                        // Center Play/Pause feedback animation
-                        if (_showPlaybackStatus)
-                          Center(
-                            child: Container(
-                              padding: const EdgeInsets.all(22),
-                              decoration: BoxDecoration(
-                                color: const Color(0xB3000000),
-                                shape: BoxShape.circle,
-                                border: Border.all(
-                                  color: const Color(0x995B8CFF),
-                                  width: 2,
-                                ),
-                              ),
-                              child: Icon(
-                                (controller?.value.isPlaying ?? false)
-                                    ? Icons.play_arrow_rounded
-                                    : Icons.pause_rounded,
-                                size: 52,
-                                color: Colors.white,
-                              ),
-                            ),
-                          ),
-
-                        // Bottom Floating Controls Overlay
+                        // Custom bottom overlay – play, live, reconnect
                         AnimatedOpacity(
-                          opacity: _showControls ? 1.0 : 0.0,
+                          opacity: _showOverlay ? 1.0 : 0.0,
                           duration: const Duration(milliseconds: 250),
                           child: IgnorePointer(
-                            ignoring: !_showControls,
-                            child: _buildBottomControls(),
+                            ignoring: !_showOverlay,
+                            child: _buildBottomOverlay(),
                           ),
                         ),
                       ],
@@ -371,20 +336,20 @@ class _PlayerState extends State<Player> {
     );
   }
 
-  Widget _buildTopBar() {
+  Widget _buildTopOverlay() {
     return Positioned(
       top: 0,
       left: 0,
       right: 0,
       child: Container(
-        padding: const EdgeInsets.fromLTRB(20, 24, 20, 40),
+        padding: const EdgeInsets.fromLTRB(16, 20, 16, 36),
         decoration: const BoxDecoration(
           gradient: LinearGradient(
             begin: Alignment.topCenter,
             end: Alignment.bottomCenter,
             colors: [
-              Color(0xCC000000),
-              Color(0x80000000),
+              Color(0xDD000000),
+              Color(0x88000000),
               Colors.transparent,
             ],
           ),
@@ -393,20 +358,19 @@ class _PlayerState extends State<Player> {
           bottom: false,
           child: Row(
             children: [
-              IconButton(
-                icon: const Icon(Icons.arrow_back_ios_new_rounded,
-                    color: Colors.white, size: 22),
+              _OverlayIconButton(
+                icon: Icons.arrow_back_ios_new_rounded,
+                onTap: () => Navigator.of(context).maybePop(),
                 tooltip: 'Back',
-                onPressed: () => Navigator.of(context).maybePop(),
               ),
-              const SizedBox(width: 8),
+              const SizedBox(width: 12),
               if (widget.channel.logoUrl.isNotEmpty) ...[
                 ClipRRect(
-                  borderRadius: BorderRadius.circular(6),
+                  borderRadius: BorderRadius.circular(8),
                   child: Container(
                     color: Colors.white,
-                    width: 34,
-                    height: 34,
+                    width: 36,
+                    height: 36,
                     padding: const EdgeInsets.all(3),
                     child: Image.network(
                       widget.channel.logoUrl,
@@ -439,6 +403,7 @@ class _PlayerState extends State<Player> {
                     const SizedBox(height: 3),
                     Row(
                       children: [
+                        // Pulsing LIVE dot
                         Container(
                           width: 8,
                           height: 8,
@@ -449,11 +414,11 @@ class _PlayerState extends State<Player> {
                         ),
                         const SizedBox(width: 6),
                         Text(
-                          'LIVE STREAM • ${widget.channel.category}',
+                          'LIVE  •  ${widget.channel.category}',
                           style: TextStyle(
                             fontSize: 12,
                             fontWeight: FontWeight.w600,
-                            color: Colors.white.withValues(alpha: 0.75),
+                            color: Colors.white.withValues(alpha: 0.7),
                             letterSpacing: 0.5,
                           ),
                         ),
@@ -462,12 +427,6 @@ class _PlayerState extends State<Player> {
                   ],
                 ),
               ),
-              IconButton(
-                icon: const Icon(Icons.refresh_rounded,
-                    color: Colors.white, size: 24),
-                tooltip: 'Reconnect stream',
-                onPressed: _retryChannel,
-              ),
             ],
           ),
         ),
@@ -475,7 +434,7 @@ class _PlayerState extends State<Player> {
     );
   }
 
-  Widget _buildBottomControls() {
+  Widget _buildBottomOverlay() {
     final isPlaying = _videoPlayerController?.value.isPlaying ?? false;
 
     return Positioned(
@@ -483,7 +442,7 @@ class _PlayerState extends State<Player> {
       left: 0,
       right: 0,
       child: Container(
-        padding: const EdgeInsets.fromLTRB(28, 50, 28, 28),
+        padding: const EdgeInsets.fromLTRB(24, 48, 24, 24),
         decoration: const BoxDecoration(
           gradient: LinearGradient(
             begin: Alignment.bottomCenter,
@@ -500,25 +459,26 @@ class _PlayerState extends State<Player> {
           child: Row(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              _PlayerControlButton(
-                selected: _selectedControl == 0,
-                icon: isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
+              _OverlayActionButton(
+                icon: isPlaying
+                    ? Icons.pause_rounded
+                    : Icons.play_arrow_rounded,
                 label: isPlaying ? 'Pause' : 'Play',
-                onTap: () {
-                  setState(() => _selectedControl = 0);
-                  _togglePlayback();
-                },
+                onTap: _togglePlayback,
+                isPrimary: true,
               ),
               const SizedBox(width: 14),
-              _PlayerControlButton(
-                selected: _selectedControl == 1,
+              _OverlayActionButton(
                 icon: Icons.skip_next_rounded,
                 label: 'Go Live',
+                onTap: _goLive,
                 badgeColor: const Color(0xFFFF2E56),
-                onTap: () {
-                  setState(() => _selectedControl = 1);
-                  _goLive();
-                },
+              ),
+              const SizedBox(width: 14),
+              _OverlayActionButton(
+                icon: Icons.refresh_rounded,
+                label: 'Retry',
+                onTap: _retryChannel,
               ),
             ],
           ),
@@ -528,44 +488,73 @@ class _PlayerState extends State<Player> {
   }
 }
 
-class _PlayerControlButton extends StatelessWidget {
-  const _PlayerControlButton({
-    required this.selected,
+// --- Helper Widgets ---
+
+class _OverlayIconButton extends StatelessWidget {
+  const _OverlayIconButton({
+    required this.icon,
+    required this.onTap,
+    this.tooltip,
+  });
+  final IconData icon;
+  final VoidCallback onTap;
+  final String? tooltip;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.white.withValues(alpha: 0.12),
+      shape: const CircleBorder(),
+      child: InkWell(
+        customBorder: const CircleBorder(),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.all(10),
+          child: Icon(icon, color: Colors.white, size: 22),
+        ),
+      ),
+    );
+  }
+}
+
+class _OverlayActionButton extends StatelessWidget {
+  const _OverlayActionButton({
     required this.icon,
     required this.label,
     required this.onTap,
+    this.isPrimary = false,
     this.badgeColor,
   });
 
-  final bool selected;
   final IconData icon;
   final String label;
   final VoidCallback onTap;
+  final bool isPrimary;
   final Color? badgeColor;
 
   @override
   Widget build(BuildContext context) {
     return Material(
-      color: selected
+      color: isPrimary
           ? const Color(0xFF386BF6)
           : const Color(0xFF1E2536).withValues(alpha: 0.85),
-      elevation: selected ? 8 : 2,
-      shadowColor: selected
+      elevation: isPrimary ? 8 : 2,
+      shadowColor: isPrimary
           ? const Color(0xFF386BF6).withValues(alpha: 0.6)
           : Colors.black45,
-      borderRadius: BorderRadius.circular(16),
+      borderRadius: BorderRadius.circular(14),
       child: InkWell(
-        borderRadius: BorderRadius.circular(16),
+        borderRadius: BorderRadius.circular(14),
         onTap: onTap,
         child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 14),
+          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
           decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(16),
+            borderRadius: BorderRadius.circular(14),
             border: Border.all(
-              color: selected
+              color: isPrimary
                   ? const Color(0xFF9AB5FF)
-                  : Colors.white.withValues(alpha: 0.12),
-              width: selected ? 2 : 1,
+                  : Colors.white.withValues(alpha: 0.1),
+              width: isPrimary ? 1.5 : 1,
             ),
           ),
           child: Row(
@@ -582,12 +571,12 @@ class _PlayerControlButton extends StatelessWidget {
                 ),
                 const SizedBox(width: 8),
               ],
-              Icon(icon, size: 24, color: Colors.white),
-              const SizedBox(width: 10),
+              Icon(icon, size: 22, color: Colors.white),
+              const SizedBox(width: 8),
               Text(
                 label,
                 style: const TextStyle(
-                  fontSize: 16,
+                  fontSize: 15,
                   fontWeight: FontWeight.w700,
                   color: Colors.white,
                   letterSpacing: 0.3,
@@ -659,10 +648,9 @@ class _UnavailablePlayer extends StatelessWidget {
             Positioned(
               top: 16,
               left: 16,
-              child: IconButton(
-                icon: const Icon(Icons.arrow_back_ios_new_rounded,
-                    color: Colors.white),
-                onPressed: () => Navigator.of(context).maybePop(),
+              child: _OverlayIconButton(
+                icon: Icons.arrow_back_ios_new_rounded,
+                onTap: () => Navigator.of(context).maybePop(),
               ),
             ),
             Center(
@@ -677,7 +665,8 @@ class _UnavailablePlayer extends StatelessWidget {
                         color: const Color(0xFF1E2536),
                         shape: BoxShape.circle,
                         border: Border.all(
-                          color: const Color(0xFF5B8CFF).withValues(alpha: 0.3),
+                          color:
+                              const Color(0xFF5B8CFF).withValues(alpha: 0.3),
                           width: 2,
                         ),
                       ),
