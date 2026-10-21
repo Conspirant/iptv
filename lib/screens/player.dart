@@ -114,6 +114,8 @@ class _PlayerState extends State<Player> {
         _stallRecovery();
       });
     }
+
+    setState(() {});
   }
 
   Future<void> _stallRecovery() async {
@@ -298,18 +300,28 @@ class _PlayerState extends State<Player> {
                         // Direct VideoPlayer with BoxFit scaling
                         if (controller != null && isInitialized)
                           Center(
-                            child: FittedBox(
-                              fit: _boxFit,
-                              child: SizedBox(
-                                width: controller.value.size.width > 0
-                                    ? controller.value.size.width
-                                    : 16,
-                                height: controller.value.size.height > 0
-                                    ? controller.value.size.height
-                                    : 9,
-                                child: VideoPlayer(controller),
-                              ),
-                            ),
+                            child: _boxFit == BoxFit.cover
+                                ? SizedBox.expand(
+                                    child: FittedBox(
+                                      fit: BoxFit.cover,
+                                      child: SizedBox(
+                                        width: controller.value.size.width > 0
+                                            ? controller.value.size.width
+                                            : 16,
+                                        height: controller.value.size.height > 0
+                                            ? controller.value.size.height
+                                            : 9,
+                                        child: VideoPlayer(controller),
+                                      ),
+                                    ),
+                                  )
+                                : AspectRatio(
+                                    aspectRatio:
+                                        controller.value.aspectRatio > 0
+                                            ? controller.value.aspectRatio
+                                            : (16 / 9),
+                                    child: VideoPlayer(controller),
+                                  ),
                           ),
 
                         // Buffering indicator
