@@ -1,30 +1,35 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:video_player/video_player.dart';
+import 'package:media_kit/media_kit.dart' as mk;
+import 'package:media_kit_video/media_kit_video.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../model/channel.dart';
 
-class Player extends StatefulWidget {
-  const Player({super.key, required this.channel});
+class PlayerScreen extends StatefulWidget {
+  const PlayerScreen({super.key, required this.channel});
 
   final Channel channel;
 
   @override
-  State<Player> createState() => _PlayerState();
+  State<PlayerScreen> createState() => _PlayerScreenState();
 }
 
-class _PlayerState extends State<Player> {
-  VideoPlayerController? _videoPlayerController;
+class _PlayerScreenState extends State<PlayerScreen> {
+  late final mk.Player _player;
+  late final VideoController _videoController;
+
   bool _isLoading = true;
-  bool _channelNotFound = false;
+  bool _hasError = false;
+  bool _isPlaying = false;
+  bool _isBuffering = false;
   bool _showOverlay = false;
   BoxFit _boxFit = BoxFit.contain;
+
   Timer? _hideOverlayTimer;
-  Timer? _stallRecoveryTimer;
-  Duration _lastPosition = Duration.zero;
-  int _stallCount = 0;
+  Timer? _loadTimeoutTimer;
+  final List<StreamSubscription> _subscriptions = [];
 
   @override
   void initState() {
@@ -32,7 +37,7 @@ class _PlayerState extends State<Player> {
     HardwareKeyboard.instance.addHandler(_handleRemoteKey);
     WakelockPlus.enable();
     _setImmersiveMode();
-    _initializePlayer();
+    _initMediaKitPlayer();
   }
 
   void _setImmersiveMode() {
@@ -46,130 +51,116 @@ class _PlayerState extends State<Player> {
     );
   }
 
-  Future<void> _initializePlayer() async {
-    try {
-      final controller = VideoPlayerController.networkUrl(
-        Uri.parse(widget.channel.streamUrl),
-        videoPlayerOptions: VideoPlayerOptions(
-          mixWithOthers: false,
-          allowBackgroundPlayback: false,
-        ),
-      );
-      _videoPlayerController = controller;
+  void _initMediaKitPlayer() {
+    _player = mk.Player(
+      configuration: const mk.PlayerConfiguration(
+        bufferSize: 32 * 1024 * 1024, // 32 MB buffer for ultra-smooth HLS playback
+      ),
+    );
 
-      await controller.initialize().timeout(const Duration(seconds: 15));
-      if (!mounted) return;
+    _videoController = VideoController(
+      _player,
+      configuration: const VideoControllerConfiguration(
+        enableHardwareAcceleration: true,
+      ),
+    );
 
-      await controller.play();
+    _subscriptions.add(
+      _player.stream.playing.listen((playing) {
+        if (!mounted) return;
+        setState(() {
+          _isPlaying = playing;
+          if (playing) {
+            _isLoading = false;
+            _hasError = false;
+            _loadTimeoutTimer?.cancel();
+          }
+        });
+      }),
+    );
 
-      controller.addListener(_onPlayerStateChanged);
+    _subscriptions.add(
+      _player.stream.buffering.listen((buffering) {
+        if (!mounted) return;
+        setState(() => _isBuffering = buffering);
+      }),
+    );
 
-      if (mounted) {
+    _subscriptions.add(
+      _player.stream.videoParams.listen((params) {
+        if (!mounted) return;
+        if (params.w != null && params.w! > 0) {
+          setState(() {
+            _isLoading = false;
+            _hasError = false;
+            _loadTimeoutTimer?.cancel();
+          });
+        }
+      }),
+    );
+
+    _subscriptions.add(
+      _player.stream.error.listen((error) {
+        if (!mounted) return;
         setState(() {
           _isLoading = false;
-          _channelNotFound = false;
+          _hasError = true;
         });
-        // Reveal controls briefly on start, then auto-fade
-        _revealOverlay();
+      }),
+    );
+
+    // Timeout fallback (12 seconds)
+    _loadTimeoutTimer = Timer(const Duration(seconds: 12), () {
+      if (mounted && _isLoading && !_isPlaying) {
+        setState(() {
+          _isLoading = false;
+          _hasError = true;
+        });
       }
+    });
+
+    _openStream();
+  }
+
+  Future<void> _openStream() async {
+    setState(() {
+      _isLoading = true;
+      _hasError = false;
+    });
+
+    try {
+      await _player.open(mk.Media(widget.channel.streamUrl));
+      await _player.play();
+      _revealOverlay();
     } catch (_) {
       if (mounted) {
         setState(() {
           _isLoading = false;
-          _channelNotFound = true;
+          _hasError = true;
         });
       }
     }
   }
 
-  void _onPlayerStateChanged() {
-    final controller = _videoPlayerController;
-    if (!mounted || controller == null) return;
-
-    if (controller.value.isPlaying) {
-      WakelockPlus.enable();
-    } else {
-      WakelockPlus.disable();
-    }
-
-    if (controller.value.hasError && !_channelNotFound) {
-      setState(() {
-        _isLoading = false;
-        _channelNotFound = true;
-      });
-      return;
-    }
-
-    // Auto-recovery for stream stalls
-    if (controller.value.isPlaying && !controller.value.isBuffering) {
-      if (_lastPosition != controller.value.position) {
-        _lastPosition = controller.value.position;
-        _stallCount = 0;
-        _stallRecoveryTimer?.cancel();
-        _stallRecoveryTimer = null;
-      }
-    } else if (controller.value.isPlaying && controller.value.isBuffering) {
-      _stallRecoveryTimer ??= Timer(const Duration(seconds: 8), () {
-        if (!mounted || _videoPlayerController == null) return;
-        _stallRecovery();
-      });
-    }
-
-    setState(() {});
-  }
-
-  Future<void> _stallRecovery() async {
-    _stallRecoveryTimer = null;
-    final controller = _videoPlayerController;
-    if (controller == null || !mounted) return;
-
-    _stallCount++;
-    if (_stallCount > 3) {
-      _retryChannel();
-      return;
-    }
-
-    try {
-      final duration = controller.value.duration;
-      if (duration > Duration.zero) {
-        await controller.seekTo(duration);
-      }
-      await controller.play();
-    } catch (_) {}
+  void _retryChannel() {
+    _loadTimeoutTimer?.cancel();
+    _openStream();
   }
 
   @override
   void dispose() {
     HardwareKeyboard.instance.removeHandler(_handleRemoteKey);
     _hideOverlayTimer?.cancel();
-    _stallRecoveryTimer?.cancel();
+    _loadTimeoutTimer?.cancel();
 
-    final video = _videoPlayerController;
-    if (video != null) {
-      video.removeListener(_onPlayerStateChanged);
-      video.dispose();
+    for (final s in _subscriptions) {
+      s.cancel();
     }
 
+    _player.dispose();
     WakelockPlus.disable();
     _restoreUIMode();
     super.dispose();
-  }
-
-  void _retryChannel() {
-    setState(() {
-      _isLoading = true;
-      _channelNotFound = false;
-      _showOverlay = false;
-    });
-
-    final video = _videoPlayerController;
-    if (video != null) {
-      video.removeListener(_onPlayerStateChanged);
-      video.dispose();
-    }
-
-    _videoPlayerController = null;
-    _initializePlayer();
   }
 
   void _toggleOverlay() {
@@ -190,13 +181,13 @@ class _PlayerState extends State<Player> {
   }
 
   bool _handleRemoteKey(KeyEvent event) {
-    if (!mounted || _isLoading || _channelNotFound || event is! KeyDownEvent) {
+    if (!mounted || _isLoading || _hasError || event is! KeyDownEvent) {
       return false;
     }
 
     final key = event.logicalKey;
 
-    // Back button handling
+    // Back button
     if (key == LogicalKeyboardKey.goBack ||
         key == LogicalKeyboardKey.escape ||
         key == LogicalKeyboardKey.backspace) {
@@ -209,7 +200,7 @@ class _PlayerState extends State<Player> {
       return true;
     }
 
-    // Select/Enter shows overlay or toggles play
+    // Select/Enter
     final isSelect = key == LogicalKeyboardKey.select ||
         key == LogicalKeyboardKey.enter ||
         key == LogicalKeyboardKey.numpadEnter;
@@ -223,7 +214,7 @@ class _PlayerState extends State<Player> {
       return true;
     }
 
-    // Play/Pause media keys
+    // Play/Pause keys
     if (key == LogicalKeyboardKey.mediaPlayPause ||
         key == LogicalKeyboardKey.mediaPlay ||
         key == LogicalKeyboardKey.mediaPause) {
@@ -231,7 +222,7 @@ class _PlayerState extends State<Player> {
       return true;
     }
 
-    // Arrow keys reveal overlay and reset timer
+    // Arrow keys
     if (key == LogicalKeyboardKey.arrowLeft ||
         key == LogicalKeyboardKey.arrowRight ||
         key == LogicalKeyboardKey.arrowUp ||
@@ -244,28 +235,17 @@ class _PlayerState extends State<Player> {
   }
 
   void _togglePlayback() {
-    final controller = _videoPlayerController;
-    if (controller == null) return;
-
-    if (controller.value.isPlaying) {
-      controller.pause();
-    } else {
-      controller.play();
-    }
+    _player.playOrPause();
     _revealOverlay();
   }
 
   Future<void> _goLive() async {
-    final controller = _videoPlayerController;
-    if (controller == null) return;
-
-    try {
-      final duration = controller.value.duration;
-      if (duration > Duration.zero) {
-        await controller.seekTo(duration);
-      }
-    } catch (_) {}
-    await controller.play();
+    // For live HLS streams, seeking to end syncs to live edge
+    final duration = _player.state.duration;
+    if (duration > Duration.zero) {
+      await _player.seek(duration);
+    }
+    await _player.play();
     _revealOverlay();
   }
 
@@ -278,14 +258,11 @@ class _PlayerState extends State<Player> {
 
   @override
   Widget build(BuildContext context) {
-    final controller = _videoPlayerController;
-    final isInitialized = controller?.value.isInitialized ?? false;
-
     return Scaffold(
       backgroundColor: Colors.black,
       body: _isLoading
           ? const _LoadingPlayer()
-          : _channelNotFound
+          : _hasError
               ? _UnavailablePlayer(onRetry: _retryChannel)
               : GestureDetector(
                   behavior: HitTestBehavior.opaque,
@@ -297,35 +274,22 @@ class _PlayerState extends State<Player> {
                     child: Stack(
                       fit: StackFit.expand,
                       children: [
-                        // Direct VideoPlayer with BoxFit scaling
-                        if (controller != null && isInitialized)
-                          Center(
-                            child: _boxFit == BoxFit.cover
-                                ? SizedBox.expand(
-                                    child: FittedBox(
-                                      fit: BoxFit.cover,
-                                      child: SizedBox(
-                                        width: controller.value.size.width > 0
-                                            ? controller.value.size.width
-                                            : 16,
-                                        height: controller.value.size.height > 0
-                                            ? controller.value.size.height
-                                            : 9,
-                                        child: VideoPlayer(controller),
-                                      ),
-                                    ),
-                                  )
-                                : AspectRatio(
-                                    aspectRatio:
-                                        controller.value.aspectRatio > 0
-                                            ? controller.value.aspectRatio
-                                            : (16 / 9),
-                                    child: VideoPlayer(controller),
-                                  ),
+                        // MediaKit Video Player (mpv/FFmpeg engine)
+                        Center(
+                          child: Video(
+                            controller: _videoController,
+                            fit: _boxFit,
+                            fill: Colors.black,
+                            alignment: Alignment.center,
+                            controls: NoVideoControls,
+                            wakelock: true,
+                            pauseUponEnteringBackgroundMode: false,
+                            resumeUponEnteringForegroundMode: true,
                           ),
+                        ),
 
                         // Buffering indicator
-                        if (controller != null && controller.value.isBuffering)
+                        if (_isBuffering)
                           const Center(
                             child: Column(
                               mainAxisSize: MainAxisSize.min,
@@ -351,7 +315,7 @@ class _PlayerState extends State<Player> {
                             ),
                           ),
 
-                        // Custom top overlay – channel info + back + zoom
+                        // Top Controls Overlay
                         AnimatedOpacity(
                           opacity: _showOverlay ? 1.0 : 0.0,
                           duration: const Duration(milliseconds: 250),
@@ -361,7 +325,7 @@ class _PlayerState extends State<Player> {
                           ),
                         ),
 
-                        // Custom bottom overlay – play, live, reconnect
+                        // Bottom Controls Overlay
                         AnimatedOpacity(
                           opacity: _showOverlay ? 1.0 : 0.0,
                           duration: const Duration(milliseconds: 250),
@@ -473,7 +437,8 @@ class _PlayerState extends State<Player> {
                     ? Icons.fullscreen_rounded
                     : Icons.fit_screen_rounded,
                 onTap: _toggleFit,
-                tooltip: _boxFit == BoxFit.contain ? 'Fill Screen' : 'Fit Screen',
+                tooltip:
+                    _boxFit == BoxFit.contain ? 'Fill Screen' : 'Fit Screen',
               ),
             ],
           ),
@@ -483,8 +448,6 @@ class _PlayerState extends State<Player> {
   }
 
   Widget _buildBottomOverlay() {
-    final isPlaying = _videoPlayerController?.value.isPlaying ?? false;
-
     return Positioned(
       bottom: 0,
       left: 0,
@@ -508,10 +471,10 @@ class _PlayerState extends State<Player> {
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               _OverlayActionButton(
-                icon: isPlaying
+                icon: _isPlaying
                     ? Icons.pause_rounded
                     : Icons.play_arrow_rounded,
-                label: isPlaying ? 'Pause' : 'Play',
+                label: _isPlaying ? 'Pause' : 'Play',
                 onTap: _togglePlayback,
                 isPrimary: true,
               ),
@@ -536,7 +499,12 @@ class _PlayerState extends State<Player> {
   }
 }
 
-// --- Helper Widgets ---
+// Keep Player class alias for backwards compatibility
+class Player extends PlayerScreen {
+  const Player({super.key, required super.channel});
+}
+
+// --- Helper UI Widgets ---
 
 class _OverlayIconButton extends StatelessWidget {
   const _OverlayIconButton({
@@ -668,7 +636,7 @@ class _LoadingPlayer extends StatelessWidget {
             ),
             SizedBox(height: 6),
             Text(
-              'Optimizing buffer for smooth playback',
+              'Hardware acceleration active (mpv)',
               style: TextStyle(
                 fontSize: 13,
                 color: Colors.white54,
